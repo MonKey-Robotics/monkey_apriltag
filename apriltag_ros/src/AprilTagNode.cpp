@@ -2,6 +2,7 @@
 #include "pose_estimation.hpp"
 #include <apriltag_msgs/msg/april_tag_detection.hpp>
 #include <apriltag_msgs/msg/april_tag_detection_array.hpp>
+#include <apriltag_msgs/msg/april_tag_pose_id.hpp>
 #ifdef cv_bridge_HPP
 #include <cv_bridge/cv_bridge.hpp>
 #else
@@ -13,8 +14,10 @@
 #include <rclcpp_components/register_node_macro.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
-#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/pose_stamped.hpp> 
 #include <geometry_msgs/msg/pose_array.hpp> 
+#include <tf2_ros/transform_broadcaster.h>
+#include <sqlite3.h> //SQLite Library
 
 // apriltag
 #include "tag_functions.hpp"
@@ -81,6 +84,8 @@ private:
 
     const image_transport::CameraSubscriber sub_cam;
     const rclcpp::Publisher<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr pub_detections;
+    const rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_pose_array; // Updated this line
+    // const rclcpp::Publisher<apriltag_msgs::msg::AprilTagPoseId>::SharedPtr pub_pose_id;
     tf2_ros::TransformBroadcaster tf_broadcaster;
 
     pose_estimation_f estimate_pose = nullptr;
@@ -88,6 +93,8 @@ private:
     void onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img, const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci);
 
     rcl_interfaces::msg::SetParametersResult onParameter(const std::vector<rclcpp::Parameter>& parameters);
+
+    void getTagInfoFromDatabase(std::unordered_map<int, std::string>& tag_frames, std::unordered_map<int, double>& tag_sizes);
 };
 
 RCLCPP_COMPONENTS_REGISTER_NODE(AprilTagNode)
@@ -106,16 +113,13 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
         declare_parameter("image_transport", "raw", descr({}, true)),
         rmw_qos_profile_sensor_data)),
     pub_detections(create_publisher<apriltag_msgs::msg::AprilTagDetectionArray>("detections", rclcpp::QoS(1))),
+    pub_pose_array(create_publisher<geometry_msgs::msg::PoseArray>("pose_array", rclcpp::QoS(1))), // Updated this line
+    // pub_pose_id(create_publisher<apriltag_msgs::msg::AprilTagPoseId>("tag_pose_id", rclcpp::QoS(1))),
     tf_broadcaster(this)
 {
     // read-only parameters
     const std::string tag_family = declare_parameter("family", "36h11", descr("tag family", true));
     tag_edge_size = declare_parameter("size", 1.0, descr("default tag size", true));
-
-    // get tag names, IDs and sizes
-    const auto ids = declare_parameter("tag.ids", std::vector<int64_t>{}, descr("tag ids", true));
-    const auto frames = declare_parameter("tag.frames", std::vector<std::string>{}, descr("tag frame names per id", true));
-    const auto sizes = declare_parameter("tag.sizes", std::vector<double>{}, descr("tag sizes per id", true));
 
     // get method for estimating tag pose
     const std::string& pose_estimation_method =
@@ -144,19 +148,30 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     declare_parameter("max_hamming", 0, descr("reject detections with more corrected bits than allowed"));
     declare_parameter("profile", false, descr("print profiling information to stdout"));
 
-    if(!frames.empty()) {
-        if(ids.size() != frames.size()) {
-            throw std::runtime_error("Number of tag ids (" + std::to_string(ids.size()) + ") and frames (" + std::to_string(frames.size()) + ") mismatch!");
-        }
-        for(size_t i = 0; i < ids.size(); i++) { tag_frames[ids[i]] = frames[i]; }
-    }
+    const auto use_database = declare_parameter("use_database", false, descr("Whether to get tag info from SQLite database"));
+    if (use_database) {
+        // Get tag frames and sizes from SQLite database
+        getTagInfoFromDatabase(tag_frames, tag_sizes);  // Fetch both tag ID, frame, and size
+    } else {
+        // get tag names, IDs and sizes
+        const auto ids = declare_parameter("tag.ids", std::vector<int64_t>{}, descr("tag ids", true));
+        const auto frames = declare_parameter("tag.frames", std::vector<std::string>{}, descr("tag frame names per id", true));
+        const auto sizes = declare_parameter("tag.sizes", std::vector<double>{}, descr("tag sizes per id", true));
 
-    if(!sizes.empty()) {
-        // use tag specific size
-        if(ids.size() != sizes.size()) {
-            throw std::runtime_error("Number of tag ids (" + std::to_string(ids.size()) + ") and sizes (" + std::to_string(sizes.size()) + ") mismatch!");
+        if(!frames.empty()) {
+            if(ids.size() != frames.size()) {
+                throw std::runtime_error("Number of tag ids (" + std::to_string(ids.size()) + ") and frames (" + std::to_string(frames.size()) + ") mismatch!");
+            }
+            for(size_t i = 0; i < ids.size(); i++) { tag_frames[ids[i]] = frames[i]; }
         }
-        for(size_t i = 0; i < ids.size(); i++) { tag_sizes[ids[i]] = sizes[i]; }
+
+        if(!sizes.empty()) {
+            // use tag specific size
+            if(ids.size() != sizes.size()) {
+                throw std::runtime_error("Number of tag ids (" + std::to_string(ids.size()) + ") and sizes (" + std::to_string(sizes.size()) + ") mismatch!");
+            }
+            for(size_t i = 0; i < ids.size(); i++) { tag_sizes[ids[i]] = sizes[i]; }
+        }
     }
 
     if(tag_fun.count(tag_family)) {
@@ -199,6 +214,9 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
     zarray_t* detections = apriltag_detector_detect(td, &im);
     mutex.unlock();
 
+    // No detections found
+    if (zarray_size(detections) == 0) continue;
+
     if(profile)
         timeprofile_display(td->tp);
 
@@ -206,6 +224,10 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
     msg_detections.header = msg_img->header;
 
     std::vector<geometry_msgs::msg::TransformStamped> tfs;
+    
+    // Initialize PoseArray message
+    geometry_msgs::msg::PoseArray pose_array;
+    pose_array.header = msg_img->header;  // Set header for PoseArray
 
     for(int i = 0; i < zarray_size(detections); i++) {
         apriltag_detection_t* det;
@@ -236,6 +258,7 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
 
         // 3D orientation and position
         if(estimate_pose != nullptr && calibrated) {
+            // Compute TF
             geometry_msgs::msg::TransformStamped tf;
             tf.header = msg_img->header;
             // set child frame name by generic tag name or configured tag name
@@ -243,13 +266,29 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
             const double size = tag_sizes.count(det->id) ? tag_sizes.at(det->id) : tag_edge_size;
             tf.transform = estimate_pose(det, intrinsics, size);
             tfs.push_back(tf);
+
+            // Add pose to PoseArray
+            geometry_msgs::msg::Pose pose;
+            pose.position.x = tf.transform.translation.x;
+            pose.position.y = tf.transform.translation.y;
+            pose.position.z = tf.transform.translation.z;
+            pose.orientation = tf.transform.rotation;
+
+            pose_array.poses.push_back(pose); // Add pose to the PoseArray
+
+            // Pose with ID
+            // apriltag_msgs::msg::AprilTagPoseId msg_pose_id;
+            // msg_pose_id.header = msg_img->header;
+            // msg_pose_id.family = std::string(det->family->name);
+            // msg_pose_id.id = det->id;
+            // msg_pose_id.pose = pose
+            // pub_pose_id->publish(msg_pose_id);  // Publish pose with ID
         }
     }
 
     pub_detections->publish(msg_detections);
-
-    if(estimate_pose != nullptr)
-        tf_broadcaster.sendTransform(tfs);
+    pub_pose_array->publish(pose_array); // Publish the PoseArray message
+    tf_broadcaster.sendTransform(tfs);
 
     apriltag_detections_destroy(detections);
 }
@@ -279,4 +318,46 @@ AprilTagNode::onParameter(const std::vector<rclcpp::Parameter>& parameters)
     result.successful = true;
 
     return result;
+}
+
+// SQLite query to get tag information (ID and Frame Name)
+void AprilTagNode::getTagInfoFromDatabase(
+    std::unordered_map<int, std::string>& tag_frames, std::unordered_map<int, double>& tag_sizes) 
+{
+    sqlite3* db;
+    sqlite3_stmt* stmt;
+
+    // Get SQLite database path
+    const auto path = declare_parameter("database_path", "/root/database/apriltag.db3", descr("File path for SQLite database"));
+
+    // Open the SQLite database
+    int rc = sqlite3_open(path, &db); // Specify your database path
+    if (rc) {
+         RCLCPP_ERROR(rclcpp::get_logger("AprilTagNode"), "Can't open database: %s", sqlite3_errmsg(db));
+        return;
+    }
+
+    // Prepare SQL query to get both tag ID and corresponding frame name
+    std::string sql = "SELECT id, edge_size, frame FROM Data;"; // Assuming the database table has these columns
+    rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        RCLCPP_ERROR(rclcpp::get_logger("AprilTagNode"), "Failed to prepare statement: %s", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return;
+    }
+
+    // Iterate over the rows in the result
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int tag_id = sqlite3_column_int(stmt, 0);
+        double edge_size = sqlite3_column_double(stmt, 1);
+        const char* frame_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+
+        // Store the tag ID, frame name, and size in the unordered maps
+        tag_frames[tag_id] = std::string(frame_name);
+        tag_sizes[tag_id] = edge_size;
+    }
+
+    // Clean up
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
 }
