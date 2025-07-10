@@ -14,6 +14,7 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/pose_array.hpp> 
 
 // apriltag
 #include "tag_functions.hpp"
