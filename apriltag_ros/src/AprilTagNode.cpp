@@ -17,6 +17,10 @@
 #include <geometry_msgs/msg/pose_stamped.hpp> 
 #include <geometry_msgs/msg/pose_array.hpp> 
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include "tf2_ros/transform_listener.h"
+#include "tf2_ros/buffer.h"
 #include <sqlite3.h> //SQLite Library
 
 // apriltag
@@ -79,6 +83,8 @@ private:
     std::atomic<bool> profile;
     std::unordered_map<int, std::string> tag_frames;
     std::unordered_map<int, double> tag_sizes;
+    std::string map_frame_;
+    bool publish_tf_;
 
     std::function<void(apriltag_family_t*)> tf_destructor;
 
@@ -87,6 +93,8 @@ private:
     const rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_pose_array; // Updated this line
     // const rclcpp::Publisher<apriltag_msgs::msg::AprilTagPoseId>::SharedPtr pub_pose_id;
     tf2_ros::TransformBroadcaster tf_broadcaster;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     pose_estimation_f estimate_pose = nullptr;
 
@@ -137,6 +145,9 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
         }
     }
 
+    map_frame_ = declare_parameter("map_frame", "map", descr("Name of fixed frame"));
+    publish_tf_ = declare_parameter("publish_tf", true, descr("Whether to publish tag frame tf"));
+
     // detector parameters in "detector" namespace
     declare_parameter("detector.threads", td->nthreads, descr("number of threads"));
     declare_parameter("detector.decimate", td->quad_decimate, descr("decimate resolution for quad detection"));
@@ -177,11 +188,15 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     if(tag_fun.count(tag_family)) {
         tf = tag_fun.at(tag_family).first();
         tf_destructor = tag_fun.at(tag_family).second;
-        apriltag_detector_add_family(td, tf);
+        apriltag_detector_add_family(td, tf);   
     }
     else {
         throw std::runtime_error("Unsupported tag family: " + tag_family);
     }
+
+    // TF Buffer
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 }
 
 AprilTagNode::~AprilTagNode()
@@ -215,7 +230,7 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
     mutex.unlock();
 
     // No detections found
-    if (zarray_size(detections) == 0) continue;
+    if (zarray_size(detections) == 0) return;
 
     if(profile)
         timeprofile_display(td->tp);
@@ -227,7 +242,9 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
     
     // Initialize PoseArray message
     geometry_msgs::msg::PoseArray pose_array;
-    pose_array.header = msg_img->header;  // Set header for PoseArray
+    // pose_array.header = msg_img->header;  // Set header for PoseArray
+    pose_array.header.stamp = msg_img->header.stamp;  // Set header for PoseArray
+    pose_array.header.frame_id = map_frame_;
 
     for(int i = 0; i < zarray_size(detections); i++) {
         apriltag_detection_t* det;
@@ -265,16 +282,55 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
             tf.child_frame_id = tag_frames.count(det->id) ? tag_frames.at(det->id) : std::string(det->family->name) + ":" + std::to_string(det->id);
             const double size = tag_sizes.count(det->id) ? tag_sizes.at(det->id) : tag_edge_size;
             tf.transform = estimate_pose(det, intrinsics, size);
-            tfs.push_back(tf);
+
+            try {
+                // Step 1: Get the transform from map to camera frame
+                geometry_msgs::msg::TransformStamped tf_map_to_camera =
+                    tf_buffer_->lookupTransform(msg_img->header.frame_id, "map", msg_img->header.stamp);
+
+                // Step 2: Extract yaw angle (Z-axis rotation) from that transform
+                tf2::Quaternion q_map_to_camera;
+                tf2::fromMsg(tf_map_to_camera.transform.rotation, q_map_to_camera);
+
+                double roll, pitch, yaw;
+                tf2::Matrix3x3(q_map_to_camera).getRPY(roll, pitch, yaw);  // we only need yaw
+
+                // Step 3: Apply the yaw angle as a rotation to the tag pose
+                tf2::Quaternion q_tag_cam;
+                tf2::fromMsg(tf.transform.rotation, q_tag_cam);
+
+                tf2::Quaternion rotation;
+                rotation.setRPY(roll, pitch, yaw);
+
+                tf2::Quaternion q_tag_rotated = q_tag_cam * rotation;
+                q_tag_rotated.normalize();
+
+                // Step 4: Assign the rotated quaternion
+                tf.transform.rotation = tf2::toMsg(q_tag_rotated);
+            }
+            catch (tf2::TransformException &ex) {
+                RCLCPP_WARN(get_logger(), "Transform error: %s", ex.what());
+            }
 
             // Add pose to PoseArray
-            geometry_msgs::msg::Pose pose;
-            pose.position.x = tf.transform.translation.x;
-            pose.position.y = tf.transform.translation.y;
-            pose.position.z = tf.transform.translation.z;
-            pose.orientation = tf.transform.rotation;
+            geometry_msgs::msg::PoseStamped pose;
+            pose.header = msg_img->header;
+            pose.pose.position.x = tf.transform.translation.x;
+            pose.pose.position.y = tf.transform.translation.y;
+            pose.pose.position.z = tf.transform.translation.z;
+            pose.pose.orientation = tf.transform.rotation;
 
-            pose_array.poses.push_back(pose); // Add pose to the PoseArray
+            geometry_msgs::msg::PoseStamped pose_map;
+            pose_map.header.stamp = msg_img->header.stamp;
+            pose_map.header.frame_id = map_frame_;
+            try {
+                tf_buffer_->transform(pose, pose_map, map_frame_);
+            } catch (const tf2::TransformException &ex) {
+                RCLCPP_WARN(get_logger(), "Could not transform docking pose to base_link: %s", ex.what());
+            }
+
+            tfs.push_back(tf); // Add tf to tf array
+            pose_array.poses.push_back(pose_map.pose); // Add pose to the PoseArray
 
             // Pose with ID
             // apriltag_msgs::msg::AprilTagPoseId msg_pose_id;
@@ -288,7 +344,7 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
 
     pub_detections->publish(msg_detections);
     pub_pose_array->publish(pose_array); // Publish the PoseArray message
-    tf_broadcaster.sendTransform(tfs);
+    if (publish_tf_) tf_broadcaster.sendTransform(tfs);
 
     apriltag_detections_destroy(detections);
 }
@@ -329,11 +385,12 @@ void AprilTagNode::getTagInfoFromDatabase(
 
     // Get SQLite database path
     const auto path = declare_parameter("database_path", "/root/database/apriltag.db3", descr("File path for SQLite database"));
+    RCLCPP_INFO(get_logger(), "Reading tag database file %s", path.c_str());
 
     // Open the SQLite database
-    int rc = sqlite3_open(path, &db); // Specify your database path
+    int rc = sqlite3_open(path.c_str(), &db); // Specify your database path
     if (rc) {
-         RCLCPP_ERROR(rclcpp::get_logger("AprilTagNode"), "Can't open database: %s", sqlite3_errmsg(db));
+        RCLCPP_ERROR(rclcpp::get_logger("AprilTagNode"), "Can't open database: %s", sqlite3_errmsg(db));
         return;
     }
 
