@@ -20,6 +20,13 @@ The camera intrinsics `P` in `CameraInfo` are used to compute the marker tag pos
 
 The tag poses are published on the standard TF topic `/tf` with the header set to the image header and `child_frame_id` set to either `tag<family>:<id>` (e.g. "tag36h11:0") or the frame name selected via configuration file. Additional information about detected tags is published as `AprilTagDetectionArray` message, which contains the original homography  matrix, the `hamming` distance and the `decision_margin` of the detection.
 
+### MonKey fork additions
+- `pose_array` (type: `geometry_msgs/msg/PoseArray`): one pose per detected tag in the frame `map_frame` (default `map`), published for every processed image and empty when no tag passed. The position is the tag centre. The orientation is yaw only: the horizontal direction the printed face points (towards the camera that saw it), so a tag rotated in its own plane gives the same yaw. A tag whose camera-to-`map_frame` transform is not available at the image time is left out (never published at the frame origin).
+- `frame_prefix` (default empty): prepended to every published TF child frame (tags and bundles), for example `<robot_id>/` so detectors on several robots do not publish the same frame names on the global `/tf`.
+- `publish_tf` (default `true`): publish the tag and bundle TF frames.
+- `use_database` / `database_path`: read tag frames and sizes from an SQLite table `Data(id, edge_size, frame)` instead of `tag.*`.
+- `qos_profile`: the upstream default is `default`; set `sensor_data` for the best-effort camera subscription the fork used before the 3.4.0 sync.
+
 ## Configuration
 
 The node is configured via a yaml configurations file. For the complete ROS yaml parameter file syntax, see: https://github.com/ros2/rcl/tree/master/rcl_yaml_param_parser.
