@@ -4,7 +4,7 @@
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <opencv2/core/mat.hpp>
-#include <tf2/convert.h>
+#include <tf2/convert.hpp>
 
 template<>
 void tf2::convert(const Eigen::Quaterniond& eigen_quat, geometry_msgs::msg::Quaternion& msg_quat)
@@ -56,7 +56,7 @@ tf2::toMsg(const std::pair<cv::Mat_<double>, cv::Mat_<double>>& pose)
 
     // convert compact rotation vector to angle-axis to quaternion
     const Eigen::Map<const Eigen::Vector3d> rvec(reinterpret_cast<double*>(pose.second.data));
-    const Eigen::Quaterniond q({rvec.norm(), rvec.normalized()});
+    const Eigen::Quaterniond q{Eigen::Quaterniond::AngleAxisType{rvec.norm(), rvec.normalized()}};
 
     geometry_msgs::msg::Transform t;
     tf2::convert(pose.first, t.translation);
