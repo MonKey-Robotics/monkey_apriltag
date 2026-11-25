@@ -27,6 +27,15 @@ The tag poses are published on the standard TF topic `/tf` with the header set t
 - `use_database` / `database_path`: read tag frames and sizes from an SQLite table `Data(id, edge_size, frame)` instead of `tag.*`.
 - `qos_profile`: the upstream default is `default`; set `sensor_data` for the best-effort camera subscription the fork used before the 3.4.0 sync.
 
+#### Lifecycle variant
+`AprilTagLifecycleNode` (executable `apriltag_lifecycle_node`) is a lifecycle node. While ACTIVE it has the same parameters, topics and TF output as `AprilTagNode`. Use it when the detector is needed only some of the time: when INACTIVE it has no camera subscription and no TF listener. `apriltag_node` is unchanged.
+- configure: declares the parameters and builds the detector.
+- activate: creates the TF listener and the camera subscription.
+- deactivate: destroys both. Repeat activate/deactivate as often as needed.
+- cleanup: releases the detector. The parameters stay declared, and the next configure reads them back.
+
+The camera subscription lives on a helper node `<name>_camera` in the same namespace, because Humble's `image_transport` accepts only an `rclcpp::Node`. It is created with remapping rules that put its subscriptions on the same topics as `AprilTagNode`'s. The TF buffer starts empty on every activation, so `pose_array` is empty until the camera-to-`map_frame` transform has arrived.
+
 ## Configuration
 
 The node is configured via a yaml configurations file. For the complete ROS yaml parameter file syntax, see: https://github.com/ros2/rcl/tree/master/rcl_yaml_param_parser.
