@@ -36,6 +36,7 @@ endif()
 
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(apriltag_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -138,6 +139,42 @@ rclcpp_components_register_node(AprilTagNode
 )
 target_link_libraries(AprilTagNode PRIVATE SQLite::SQLite3)
 
+
+# lifecycle variant of the composable node (MonKey fork)
+add_library(AprilTagLifecycleNode SHARED
+    src/AprilTagLifecycleNode.cpp
+)
+target_link_libraries(AprilTagLifecycleNode
+  PUBLIC
+    apriltag::apriltag
+    tags
+    pose_estimation
+    ${apriltag_msgs_TARGETS}
+    ${sensor_msgs_TARGETS}
+    cv_bridge::cv_bridge
+    image_transport::image_transport
+    rclcpp::rclcpp
+    rclcpp_components::component
+    rclcpp_lifecycle::rclcpp_lifecycle
+    sensor_msgs::sensor_msgs_library
+    tf2_ros::tf2_ros
+    tf2_geometry_msgs::tf2_geometry_msgs
+)
+target_link_libraries(AprilTagLifecycleNode PRIVATE SQLite::SQLite3)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Keep the globals of the static libraries (tag_fun, pose_estimation_methods) local to this
+  # library, so they cannot interpose with AprilTagNode's copies when both load into one process.
+  target_link_options(AprilTagLifecycleNode PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
+rclcpp_components_register_node(AprilTagLifecycleNode
+    PLUGIN "AprilTagLifecycleNode"
+    EXECUTABLE "apriltag_lifecycle_node"
+)
+install(TARGETS AprilTagLifecycleNode
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+)
+
 ament_environment_hooks(${ament_cmake_package_templates_ENVIRONMENT_HOOK_LIBRARY_PATH})
 
 install(TARGETS AprilTagNode
@@ -164,6 +201,25 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  # AprilTagLifecycleNode: camera subscription only while ACTIVE, and parity with AprilTagNode.
+  # Graph checks run under rmw_fastrtps_cpp, which needs no router, on a domain of their own.
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(class_loader REQUIRED)
+  ament_add_gtest(test_lifecycle_node test/test_lifecycle_node.cpp
+    TIMEOUT 120
+    ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=87
+  )
+  if(TARGET test_lifecycle_node)
+    target_include_directories(test_lifecycle_node PRIVATE src)
+    target_compile_definitions(test_lifecycle_node PRIVATE
+      APRILTAG_NODE_LIBRARY="$<TARGET_FILE:AprilTagNode>"
+    )
+    target_link_libraries(test_lifecycle_node
+      AprilTagLifecycleNode
+      class_loader::class_loader
+    )
+  endif()
 endif()
 
 ament_package()
